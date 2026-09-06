@@ -1,0 +1,218 @@
+// NPR Sky Light + Reflection Pixel Shader (fullscreen, additive to SceneColor).
+// Supplies the metallic environment reflection + NPR toon sky ambient, replacing the engine's own
+// deferred reflection/sky pass (which the NPR renderer disables).
+//
+//   Diffuse  : NPRSkyDiffuse (inlined) — NPR toon ambient from sky SH irradiance.
+//   Specular : reflection captures + sky via the engine compositor (CompositeReflectionCapturesAndSkylightTWS),
+//              with screen-space reflection (engine HZB RayCast) blended on top where it hits.
+//
+// Sky data is bound in C++ (RenderNPRSkyLight): real-time capture or baked SkyLight proxy, or a black
+// dummy when the scene has no sky light (captures/SSR still render).
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/LargeWorldCoordinates.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/BRDF.ush"
+// Engine HZB screen-space ray-cast (self-includes Common.ush; defines its own macros). Reused
+// wholesale for the SSR march — RayCast() returns the on-screen hit UV in buffer-UV space.
+#include "/Engine/Private/SSRT/SSRTRayCast.ush"
+// Reflection environment: capture culling grid + the capture/sky compositor. Reads ForwardLightStruct /
+// ReflectionStruct / ReflectionCaptureSM5 (bound via wrappers in C++); defines set in ModifyCompilationEnvironment.
+#include "/Engine/Private/LightGridCommon.ush"
+#include "/Engine/Private/ReflectionEnvironmentShared.ush"
+#include "/Engine/Private/ReflectionEnvironmentComposite.ush"
+
+#include "/Plugin/NPRRenderer/Public/NPREncoding.ush"
+
+//=============================================================================
+// Sky data (bound from FSkyLightSceneProxy by RenderNPRSkyLight)
+//=============================================================================
+
+// SH irradiance coefficients, packed identically to View.SkyIrradianceEnvironmentMap
+// (SetupSkyIrradianceEnvironmentMapConstantsFromSkyIrradiance). Indices [0..6] used; [7] = brightness.
+// StructuredBuffer so it can bind either the Scene's real-time SH buffer or a baked upload buffer.
+StructuredBuffer<float4> NPRSkyIrradiance;
+
+// Sky light tint (reconstructed from the SkyLight component in C++; 0 when there is no sky light).
+float3 NPRSkyColor;
+
+// Max mip of the convolved sky cubemap (== engine ReflectionStruct.SkyLightParameters.x = Log2(Width))
+float NPRSkyMaxMip;
+
+TextureCube NPRSkyCubemap;
+SamplerState NPRSkyCubemapSampler;
+
+// SSR: HZB (furthest-depth) for the engine ray-cast, the lit SceneColor copy to read hit color,
+// the HZB UV factor, and an enable flag (0 when HZB is unavailable -> sky-only fallback).
+Texture2D NPRHZBTexture;
+SamplerState NPRHZBSampler;
+float4 NPRHZBUvFactorAndInvFactor;
+Texture2D NPRSceneColorCopy;
+SamplerState NPRSceneColorSampler;
+int NPRSSREnabled;
+
+// Mobile-style cheap SSR: fewer HZB march steps than desktop (MobileSSR uses 8–12 vs 24–64).
+#define NPR_SSR_NUM_STEPS 12
+
+// Specular occlusion — copied from ReflectionEnvironmentShared.ush:GetSpecularOcclusion
+// (avoids pulling the ReflectionStruct dependency of that header).
+half NPRGetSpecularOcclusion(half NoV, half RoughnessSq, half AO)
+{
+    return saturate(pow(NoV + AO, RoughnessSq) - 1 + AO);
+}
+
+//=============================================================================
+// SH diffuse evaluation — replicated from ReflectionEnvironmentShared.ush:GetSkySHDiffuse,
+// indexing our bound NPRSkyIrradiance array instead of View.SkyIrradianceEnvironmentMap.
+//=============================================================================
+
+float3 NPRGetSkySHDiffuse(float3 Normal)
+{
+    float4 NormalVector = float4(Normal, 1.0f);
+
+    float3 Intermediate0, Intermediate1, Intermediate2;
+    Intermediate0.x = dot(NPRSkyIrradiance[0], NormalVector);
+    Intermediate0.y = dot(NPRSkyIrradiance[1], NormalVector);
+    Intermediate0.z = dot(NPRSkyIrradiance[2], NormalVector);
+
+    float4 vB = NormalVector.xyzz * NormalVector.yzzx;
+    Intermediate1.x = dot(NPRSkyIrradiance[3], vB);
+    Intermediate1.y = dot(NPRSkyIrradiance[4], vB);
+    Intermediate1.z = dot(NPRSkyIrradiance[5], vB);
+
+    float vC = NormalVector.x * NormalVector.x - NormalVector.y * NormalVector.y;
+    Intermediate2 = NPRSkyIrradiance[6].xyz * vC;
+
+    // max to not get negative colors
+    return max(0, Intermediate0 + Intermediate1 + Intermediate2);
+}
+
+//=============================================================================
+// Roughness -> cubemap mip — replicated from ReflectionEnvironmentShared.ush
+// (REFLECTION_CAPTURE_ROUGHEST_MIP = 1, REFLECTION_CAPTURE_ROUGHNESS_MIP_SCALE = 1.2)
+//=============================================================================
+
+float NPRComputeReflectionMip(float Roughness, float CubemapMaxMip)
+{
+    float LevelFrom1x1 = 1.0 - 1.2 * log2(max(Roughness, 0.001));
+    return CubemapMaxMip - 1.0 - LevelFrom1x1;
+}
+
+//=============================================================================
+// NPR Sky Diffuse (ambient) — no NoL toon band (sky has no direction L). Occlusion is AmbientOcclusion
+// floored by shadowBrightness (GBuffer.Specular, the same NPR param the direct path uses) for tonal
+// consistency. skyIrradiance is the per-normal sky SH already multiplied by SkyColor.
+//=============================================================================
+
+float3 NPRSkyDiffuse(FGBufferData GBuffer, float3 skyIrradiance, float AmbientOcclusion)
+{
+    float shadowBrightness = DecodeNPR(GBuffer.Specular);
+    float ambientMask = lerp(shadowBrightness, 1.0, saturate(AmbientOcclusion));
+    return GBuffer.DiffuseColor * skyIrradiance * ambientMask;
+}
+
+//=============================================================================
+// Main Pixel Shader (fullscreen, additive to SceneColor)
+// Input layout matches the directional/fullscreen FNPRDeferredLightVS (same as NPRShadow).
+//=============================================================================
+
+void MainPS(
+    float2 ScreenUV     : TEXCOORD0,
+    float3 ScreenVector : TEXCOORD1,
+    float4 SvPosition   : SV_POSITION,
+    out float4 OutColor : SV_Target0)
+{
+    OutColor = 0;
+
+    // ReflectionEnvironmentComposite.ush uses ResolvedView; without this it is undefined and the shader
+    // fails to compile.
+    ResolvedView = ResolveView();
+
+    FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(ScreenUV);
+    FGBufferData GBuffer = ScreenSpaceData.GBuffer;
+
+    // Only light pixels marked as using deferred shading (same as engine / NPR light pass)
+    BRANCH
+    if (GBuffer.ShadingModelID > 0)
+    {
+        float3 N = GBuffer.WorldNormal;
+        float3 CameraToPixel = normalize(ScreenVector);
+        float3 V = -CameraToPixel;
+        float  NoV = saturate(dot(N, V));
+
+        //=====================================================================
+        // Diffuse ambient (NPR toon-styled, reuses NPRBxDF params)
+        //=====================================================================
+        float3 SkyIrradiance = NPRGetSkySHDiffuse(N) * NPRSkyColor;
+        float3 Diffuse = NPRSkyDiffuse(GBuffer, SkyIrradiance, ScreenSpaceData.AmbientOcclusion);
+
+        //=====================================================================
+        // Specular reflection (metallic). Layered like the engine/mobile reflection stack:
+        //   base = reflection captures + sky (CompositeReflectionCapturesAndSkylightTWS, roughness
+        //          mip blur built in) -> SSR (on-screen scene) blended on top where it hits.
+        //=====================================================================
+        float3 R = reflect(CameraToPixel, N);
+        float SceneDepth = GBuffer.Depth;
+        float3 TranslatedWorldPos = ScreenVector * SceneDepth + GetTranslatedWorldCameraPosFromView(SvPosition.xy);
+
+        // Sky reflection fallback from OUR sky cubemap/tint. Not the compositor's built-in sky: its
+        // GetSkyLightReflection scales by View.SkyLightColor which NPR zeroes. Passed as ExtraIndirectSpecular,
+        // which the compositor adds where captures don't cover (rgb += leftoverAlpha * ExtraIndirectSpecular).
+        float SkyMip = NPRComputeReflectionMip(GBuffer.Roughness, NPRSkyMaxMip);
+        float3 SkyReflection = NPRSkyCubemap.SampleLevel(NPRSkyCubemapSampler, R, SkyMip).rgb * NPRSkyColor;
+
+        // Base IBL: placed reflection captures (parallax box/sphere, size-blended) over our sky fallback.
+        // Reuses the engine compositor wholesale for captures — they fill what SSR can't see (off-screen).
+        uint EyeIndex = 0;
+        uint GridIndex = ComputeLightGridCellIndex(uint2(SvPosition.xy - View.ViewRectMin.xy), SceneDepth, EyeIndex);
+        FCulledReflectionCapturesGridHeader CaptureGridHeader = GetCulledReflectionCapturesGridHeader(GridIndex);
+        // Engine grid path (matches ReflectionEnvironmentPixelShader.usf).
+        float3 SpecularIBL = CompositeReflectionCapturesAndSkylightTWS(
+            1.0f, TranslatedWorldPos, R, GBuffer.Roughness,
+            GBuffer.IndirectIrradiance /*from lightmap/ILC: ComputeMixingWeight normalizes captures to it (engine ReflectionEnvironmentPixelShader:136)*/,
+            1.0f /*IndirectSpecularOcclusion*/, SkyReflection /*ExtraIndirectSpecular = our sky*/,
+            CaptureGridHeader.NumReflectionCaptures, CaptureGridHeader.DataStartIndex,
+            0 /*SingleCaptureIndex*/, false /*bCompositeSkylight: false, sky supplied via ExtraIndirectSpecular*/);
+
+        // SSR: trace the reflection ray against the HZB (engine RayCast, cheap step count); on hit,
+        // read the lit scene color and blend over the IBL with a soft mobile-style fade (roughness +
+        // screen-edge vignette) so the SSR↔capture transition is smooth instead of a hard cutoff.
+        float SSRAlpha = 0.0;
+        BRANCH
+        if (NPRSSREnabled != 0)
+        {
+            float StepOffset = InterleavedGradientNoise(SvPosition.xy, View.StateFrameIndexMod8);
+            float3 HitUVz;
+            float Level;
+            bool bSSRHit = RayCast(
+                NPRHZBTexture, NPRHZBSampler,
+                TranslatedWorldPos, R,
+                GBuffer.Roughness, SceneDepth,
+                NPR_SSR_NUM_STEPS, StepOffset,
+                NPRHZBUvFactorAndInvFactor, false,
+                HitUVz, Level);
+            if (bSSRHit)
+            {
+                // Sample the scene-color mip chain at the level RayCast accumulated (8/NumSteps*Roughness per
+                // step → blur grows with roughness and ray distance, the engine's cone behavior). Level starts
+                // at 1.0, so subtract 1 to keep a mirror surface (roughness 0) on the sharp mip 0. Clamp to the
+                // top mip. Matches engine SSGI (SSRTDiffuseIndirect.usf:488 samples reduced color at Level).
+                float ColorMip = clamp(Level - 1.0, 0.0, 4.0);
+                float3 SSRColor = NPRSceneColorCopy.SampleLevel(NPRSceneColorSampler, HitUVz.xy, ColorMip).rgb;
+                // Roughness fade: SSR only meaningful on smooth surfaces (fades out 0.4 -> 0.8).
+                float RoughnessFade = saturate(1.0 - (GBuffer.Roughness - 0.4) * 2.5);
+                // Screen-edge vignette from the hit UV (hide ray-march boundary artifacts).
+                float2 Edge = smoothstep(0.0, 0.1, HitUVz.xy) * smoothstep(0.0, 0.1, 1.0 - HitUVz.xy);
+                SSRAlpha = saturate(RoughnessFade * Edge.x * Edge.y);
+                SpecularIBL = lerp(SpecularIBL, SSRColor, SSRAlpha);
+            }
+        }
+
+        float AO = GBuffer.GBufferAO * ScreenSpaceData.AmbientOcclusion;
+        float RoughnessSq = GBuffer.Roughness * GBuffer.Roughness;
+        float3 Specular = SpecularIBL
+            * EnvBRDFApprox(GBuffer.SpecularColor, GBuffer.Roughness, NoV)
+            * NPRGetSpecularOcclusion(NoV, RoughnessSq, AO);
+
+        OutColor.rgb = (Diffuse + Specular) * View.PreExposure;
+    }
+}

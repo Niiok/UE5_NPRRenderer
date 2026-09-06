@@ -1,0 +1,339 @@
+// NPR Light Pixel Shader
+// Identical to Engine's DeferredLightPixelShaders.usf — only IntegrateBxDF replaced with NPR
+//
+// Differences from engine:
+// 1. IntegrateBxDF → NPRIntegrateBxDF (NPR toon shading BxDF)
+// 2. Shadow computed inline (NPRShadowUtils.ush) instead of reading from shadow projection buffer
+// 3. Shadow.SurfaceShadow NOT multiplied in accumulator (handled inside NPRLitBxDF)
+// 4. No Substrate/Hair/Atmosphere/Cloud paths (can be added later)
+
+#ifndef SUPPORT_CONTACT_SHADOWS
+#define SUPPORT_CONTACT_SHADOWS 1
+#endif
+
+// Engine includes (same order as DeferredLightPixelShaders.usf, hair/substrate paths omitted)
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/LargeWorldCoordinates.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/DeferredLightingCommon.ush"
+#include "/Engine/Private/LightDataUniforms.ush"
+
+// NPR Modules
+#include "NPRShadowUtils.ush"
+#include "NPRBxDF.ush"
+
+// Remap light shape permutation into light type (same as engine)
+#if LIGHT_SOURCE_SHAPE == 0
+#define CURRENT_LIGHT_TYPE LIGHT_TYPE_DIRECTIONAL
+#elif LIGHT_SOURCE_SHAPE == 2
+#define CURRENT_LIGHT_TYPE LIGHT_TYPE_RECT
+#else // LIGHT_SOURCE_SHAPE == 1
+#define CURRENT_LIGHT_TYPE (IsDeferredSpotlight() ? LIGHT_TYPE_SPOT : LIGHT_TYPE_POINT)
+#endif
+
+//=============================================================================
+// Input/Output Structures (same as engine's DeferredLightPixelShaders.usf)
+//=============================================================================
+
+struct FInputParams
+{
+    float2 PixelPos;
+    float4 ScreenPosition;
+    float2 ScreenUV;
+    float3 ScreenVector;
+};
+
+struct FDerivedParams
+{
+    float3 CameraVector;
+    float3 TranslatedWorldPosition;
+};
+
+FDerivedParams GetDerivedParams(in FInputParams Input, in float SceneDepth)
+{
+    FDerivedParams Out;
+#if LIGHT_SOURCE_SHAPE > 0
+    // With a perspective projection, the clip space position is NDC * Clip.w
+    // With an orthographic projection, clip space is the same as NDC
+    float2 ClipPosition = GetScreenPositionForProjectionType(Input.ScreenPosition.xy / Input.ScreenPosition.w, SceneDepth);
+    Out.TranslatedWorldPosition = mul(float4(ClipPosition, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+    Out.CameraVector = GetCameraVectorFromTranslatedWorldPosition(Out.TranslatedWorldPosition);
+#else
+    Out.TranslatedWorldPosition = Input.ScreenVector * SceneDepth + GetTranslatedWorldCameraPosFromView(Input.PixelPos);
+    Out.CameraVector = normalize(Input.ScreenVector);
+#endif
+    return Out;
+}
+
+Texture2D<uint> LightingChannelsTexture;
+
+uint GetLightingChannelMask(float2 UV)
+{
+    uint2 IntegerUV = UV * View.BufferSizeAndInvSize.xy;
+    return LightingChannelsTexture.Load(uint3(IntegerUV, 0)).x;
+}
+
+float GetExposure()
+{
+    return View.PreExposure;
+}
+
+//=============================================================================
+// Shadow Attenuation (NPR: inline computation replaces engine's shadow buffer read)
+// Returns float4 LightAttenuation in same format as engine:
+//   .x = whole scene directional shadow
+//   .y = whole scene directional SSS shadow
+//   .z = per-object shadow / light function
+//   .w = per-object SSS shadow
+//
+// Branching is compile-time via NPR_SHADOW_TYPE permutation:
+//   0 = No shadow → returns (1,1,1,1), all shadow code stripped
+//   1 = Point cubemap → CubemapHardwarePCF, result in .zw
+//   2 = 2D ManualPCF → CSM/Spot via ScreenToShadowMatrix, result in .xy or .zw
+//=============================================================================
+
+float4 GetLightAttenuationFromShadow(in FInputParams InputParams, float SceneDepth, float3 TranslatedWorldPosition, float3 WorldNormal)
+{
+    float4 LightAttenuation = float4(1, 1, 1, 1);
+    
+#if NPR_SHADOW_TYPE == 1
+    // Point light cubemap shadow → .zw channels
+        float Shadow = ComputePointLightShadow(
+            TranslatedWorldPosition,
+            DeferredLightUniforms.TranslatedWorldPosition,
+        DeferredLightUniforms.InvRadius,
+        WorldNormal);
+    LightAttenuation = float4(1, 1, Shadow, Shadow);
+
+#elif NPR_SHADOW_TYPE == 2
+    // 2D shadow (Spot single-matrix or Directional CSM)
+    #if LIGHT_SOURCE_SHAPE > 0
+        // Spot light: direction from light to surface
+        float3 LightDirection = normalize(DeferredLightUniforms.TranslatedWorldPosition - TranslatedWorldPosition);
+#else
+        // Directional light: fixed direction
+        float3 LightDirection = -DeferredLightUniforms.Direction;
+    #endif
+        float NoL = saturate(dot(WorldNormal, LightDirection));
+        
+        ResolvedView = ResolveView();
+        float2 ScreenUV = InputParams.PixelPos * ResolvedView.BufferSizeAndInvSize.zw;
+        float2 ScreenXY = (ScreenUV - ResolvedView.ScreenPositionScaleBias.wz) / ResolvedView.ScreenPositionScaleBias.xy;
+    float4 ShadowScreenPosition = float4(GetScreenPositionForProjectionType(ScreenXY, SceneDepth), SceneDepth, 1);
+
+    float Shadow = ComputeDirectionalLightShadow(ShadowScreenPosition, SceneDepth, NoL);
+
+    #if LIGHT_SOURCE_SHAPE > 0
+        // Spot (radial): CW_BA blend in engine → only .z/.w written
+        // .z = per-object shadow, .w = per-object SSS (1.0 for non-SSS)
+        // GetShadowTermsBase (radial): SurfaceShadow = .z * Static
+        LightAttenuation = float4(1, 1, Shadow, 1);
+    #else
+        // Directional CSM: CW_RG blend in engine → only .r/.g written
+        // Channel assignment (ShadowRendering.cpp:731-740):
+        //   .r = WholeSceneShadows, non SSS   ← CSM writes here
+        //   .g = WholeSceneShadows, SSS        ← CSM writes here (1.0 for non-SSS)
+        //   .b = non WholeSceneShadows, non SSS ← NOT written by CSM (stays 1.0)
+        //   .a = non WholeSceneShadows, SSS     ← NOT written by CSM (stays 1.0)
+        // GetShadowTermsBase: SurfaceShadow = lerp(.x, Static, fade) * .z = S² * 1 = S²
+        LightAttenuation = float4(Shadow, 1, 1, 1);
+#endif
+#endif // NPR_SHADOW_TYPE
+    
+    return LightAttenuation;
+}
+
+//=============================================================================
+// NPR Lighting Accumulation
+// Copy of engine's AccumulateDynamicLighting (DeferredLightingCommon.ush)
+// ONLY changes:
+//   1. IntegrateBxDF → NPRIntegrateBxDF
+//   2. MaskedLightColor * Shadow.SurfaceShadow → MaskedLightColor (shadow handled in BxDF)
+//   3. No Transmission accumulation (NPR BxDF doesn't compute Transmission)
+//   4. SurfaceShadow returns NPR-styled shadow mask (with brightness) for NPR Shadow pass
+//=============================================================================
+
+FLightAccumulator NPRAccumulateDynamicLighting(
+    float3 TranslatedWorldPosition, half3 CameraVector, FGBufferData GBuffer, half AmbientOcclusion,
+    FDeferredLightData LightData, half4 LightAttenuation, float Dither, uint2 SVPos,
+    inout float SurfaceShadow)
+{
+    FLightAccumulator LightAccumulator = (FLightAccumulator)0;
+
+    half3 V = -CameraVector;
+    half3 N = GBuffer.WorldNormal;
+
+    // Engine: Clear coat bottom normal (kept for compatibility, CLEAR_COAT_BOTTOM_NORMAL defaults to 0)
+    BRANCH if (GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT && CLEAR_COAT_BOTTOM_NORMAL)
+    {
+        const float2 oct1 = ((float2(GBuffer.CustomData.a, GBuffer.CustomData.z) * 4) - (512.0/255.0)) + UnitVectorToOctahedron(GBuffer.WorldNormal);
+        N = OctahedronToUnitVector(oct1);
+    }
+
+    float3 L = LightData.Direction;  // Already normalized
+    float3 ToLight = L;
+    float3 MaskedLightColor = LightData.Color;
+    float LightMask = 1;
+    if (LightData.bRadialLight)
+    {
+        LightMask = GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L);
+        // Same continuous radius / custom falloff / spot-cone attenuation as UE.
+        MaskedLightColor *= LightMask;
+    }
+    else
+    {
+        // Preserve the NPR directional-light intensity normalization.
+        MaskedLightColor *= 0.1;
+    }
+
+    LightAccumulator.EstimatedCost += 0.3f;  // running the PixelShader at all has a cost
+
+    BRANCH
+    if (LightMask > 0)
+    {
+        FShadowTerms Shadow;
+        Shadow.SurfaceShadow = AmbientOcclusion;
+        Shadow.TransmissionShadow = 1;
+        Shadow.TransmissionThickness = 1;
+        Shadow.HairTransmittance.OpaqueVisibility = 1;
+        const float ContactShadowOpacity = GBuffer.CustomData.a;
+        GetShadowTerms(GBuffer.Depth, GBuffer.PrecomputedShadowFactors, GBuffer.ShadingModelID, ContactShadowOpacity,
+            LightData, TranslatedWorldPosition, L, LightAttenuation, Dither, Shadow);
+
+        LightAccumulator.EstimatedCost += 0.3f;  // add the cost of getting the shadow terms
+
+        // >>> NPR CHANGE: Engine early-out removed <<<
+        // Engine: BRANCH if (Shadow.SurfaceShadow + Shadow.TransmissionShadow > 0)
+        // NPR must always execute BxDF because shadow color is applied inside NPRLitBxDF.
+        // Skipping when shadow=0 would produce pure black instead of the intended shadow color.
+        {
+            const bool bNeedsSeparateSubsurfaceLightAccumulation = UseSubsurfaceProfile(GBuffer.ShadingModelID);
+
+            // >>> NPR CHANGE: IntegrateBxDF → NPRIntegrateBxDF <<<
+            FDirectLighting Lighting;
+
+            if (LightData.bRectLight)
+            {
+                FRect Rect = GetRect(ToLight, LightData);
+                const FRectTexture SourceTexture = ConvertToRectTexture(LightData);
+                Lighting = NPRIntegrateBxDF(GBuffer, N, V, Rect, Shadow, SourceTexture, SurfaceShadow);
+            }
+            else
+            {
+                FCapsuleLight Capsule = GetCapsule(ToLight, LightData);
+                Lighting = NPRIntegrateBxDF(GBuffer, N, V, Capsule, Shadow, LightData.bInverseSquared, SurfaceShadow);
+            }
+
+            Lighting.Specular *= LightData.SpecularScale;
+            Lighting.Diffuse  *= LightData.DiffuseScale;
+
+            // >>> NPR CHANGE: Shadow already applied inside NPRLitBxDF <<<
+            // Engine uses: MaskedLightColor * Shadow.SurfaceShadow
+            // NPR uses:    MaskedLightColor (shadow handled internally by BxDF)
+            LightAccumulator_AddSplit(LightAccumulator, Lighting.Diffuse, Lighting.Specular, Lighting.Diffuse, MaskedLightColor, bNeedsSeparateSubsurfaceLightAccumulation);
+
+            LightAccumulator.EstimatedCost += 0.4f;  // add the cost of the lighting computations
+        }
+    }
+
+    return LightAccumulator;
+}
+
+/** NPR version of GetDynamicLightingSplit (mirrors engine's DeferredLightingCommon.ush) */
+FDeferredLightingSplit NPRGetDynamicLightingSplit(
+    float3 TranslatedWorldPosition, float3 CameraVector, FGBufferData GBuffer, float AmbientOcclusion,
+    FDeferredLightData LightData, float4 LightAttenuation, float Dither, uint2 SVPos,
+    inout float SurfaceShadow)
+{
+    FLightAccumulator LightAccumulator = NPRAccumulateDynamicLighting(
+        TranslatedWorldPosition, CameraVector, GBuffer, AmbientOcclusion,
+        LightData, LightAttenuation, Dither, SVPos, SurfaceShadow);
+    return LightAccumulator_GetResultSplit(LightAccumulator);
+}
+
+/** NPR version of GetDynamicLighting (mirrors engine's DeferredLightingCommon.ush) */
+float4 NPRGetDynamicLighting(
+    float3 TranslatedWorldPosition, float3 CameraVector, FGBufferData GBuffer, float AmbientOcclusion,
+    FDeferredLightData LightData, float4 LightAttenuation, float Dither, uint2 SVPos,
+    inout float SurfaceShadow)
+{
+    FDeferredLightingSplit SplitLighting = NPRGetDynamicLightingSplit(
+        TranslatedWorldPosition, CameraVector, GBuffer, AmbientOcclusion,
+        LightData, LightAttenuation, Dither, SVPos,
+        SurfaceShadow);
+
+    return SplitLighting.SpecularLighting + SplitLighting.DiffuseLighting;
+}
+
+//=============================================================================
+// Main Pixel Shader
+// Mirrors engine's DeferredLightPixelMain (non-Substrate, non-Hair path)
+//=============================================================================
+
+void MainPS(
+#if LIGHT_SOURCE_SHAPE > 0
+    float4 InScreenPosition : TEXCOORD0,
+#else
+    float2 ScreenUV         : TEXCOORD0,
+    float3 ScreenVector     : TEXCOORD1,
+#endif
+    float4 SVPos            : SV_POSITION,
+    out float4 OutColor     : SV_Target0,
+    out float OutShadowMask : SV_Target1
+)
+{
+    const float2 PixelPos = SVPos.xy;
+    OutColor = 0;
+    OutShadowMask = 0.0;  // Default to shadow (Max blend: any actual light contribution will brighten)
+    
+    // Convert input data (directional/local light) — same as engine
+    FInputParams InputParams = (FInputParams)0;
+    InputParams.PixelPos = SVPos.xy;
+#if LIGHT_SOURCE_SHAPE > 0
+    InputParams.ScreenPosition = InScreenPosition;
+    InputParams.ScreenUV = InScreenPosition.xy / InScreenPosition.w * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+    InputParams.ScreenVector = 0;
+#else
+    InputParams.ScreenPosition = 0;
+    InputParams.ScreenUV = ScreenUV;
+    InputParams.ScreenVector = ScreenVector;
+#endif
+
+    // Engine: GBuffer read and early-out — same as engine (non-Substrate path)
+    FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(InputParams.ScreenUV);
+
+    // Only light pixels marked as using deferred shading (same as engine)
+    BRANCH if (ScreenSpaceData.GBuffer.ShadingModelID > 0
+#if USE_LIGHTING_CHANNELS
+        && (GetLightingChannelMask(InputParams.ScreenUV) & DeferredLightUniforms.LightingChannelMask)
+#endif
+        )
+    {
+        const float SceneDepth = CalcSceneDepth(InputParams.ScreenUV);
+        const FDerivedParams DerivedParams = GetDerivedParams(InputParams, SceneDepth);
+
+        FDeferredLightData LightData = InitDeferredLightFromUniforms(CURRENT_LIGHT_TYPE);
+        // Engine: UpdateLightDataColor(LightData.Color, InputParams, DerivedParams);
+        // NPR: Light profile / atmosphere / cloud not yet supported — can be added later
+
+        float Dither = InterleavedGradientNoise(InputParams.PixelPos, View.StateFrameIndexMod8);
+
+        // SurfaceShadow: inout parameter that receives NPR-styled shadow mask from BxDF
+        float SurfaceShadow = 0.0f;  // Default to shadow (Max blend: light contribution will brighten)
+
+        // NPR: Shadow computed inline instead of reading from engine's shadow projection buffer
+        float4 LightAttenuation = GetLightAttenuationFromShadow(InputParams, SceneDepth, DerivedParams.TranslatedWorldPosition, ScreenSpaceData.GBuffer.WorldNormal);
+
+        // NPR lighting (identical flow to engine's GetDynamicLighting, only BxDF replaced)
+        float4 Radiance = NPRGetDynamicLighting(
+            DerivedParams.TranslatedWorldPosition, DerivedParams.CameraVector,
+            ScreenSpaceData.GBuffer, ScreenSpaceData.AmbientOcclusion,
+            LightData, LightAttenuation, Dither, uint2(InputParams.PixelPos),
+            SurfaceShadow);
+
+        OutColor.rgb += Radiance.rgb;
+        OutShadowMask = SurfaceShadow;  // NPR shadow mask (with brightness applied)
+    }
+
+    OutColor.rgb *= GetExposure();
+}

@@ -1,0 +1,151 @@
+// NPR BxDF - Toon Shading BRDF
+// Replaces engine's IntegrateBxDF dispatch with NPR toon shading.
+// Structure mirrors engine's ShadingModels.ush + CapsuleLightIntegrate.ush + RectLightIntegrate.ush
+//
+// NOTE: NPRLitBxDF processes Shadow.SurfaceShadow internally (toon step function).
+//       The caller must NOT multiply by Shadow.SurfaceShadow again.
+
+#pragma once
+
+// Include encoding/decoding functions and constants
+#include "/Plugin/NPRRenderer/Public/NPREncoding.ush"
+
+//=============================================================================
+// NPR BRDF - Toon shading with shadow bands + PBR Specular
+//
+// Diffuse:  engine DiffuseColor, modulated by the toon shadow bands.
+// Specular: Engine's GGX identical to DefaultLitBxDF (SpecularGGX + energy conservation).
+//           shadowMask applied to specular inside BxDF (accumulator omits it).
+// Caller must NOT multiply by Shadow.SurfaceShadow again.
+//=============================================================================
+
+//=============================================================================
+// Core NPR BxDF (replaces engine's IntegrateBxDF base overload from ShadingModels.ush)
+// Same signature as: IntegrateBxDF(GBuffer, N, V, L, Falloff, NoL, AreaLight, Shadow)
+//=============================================================================
+
+FDirectLighting NPRLitBxDF(FGBufferData GBuffer, half3 N, half3 V, half3 L, float Falloff, half NoL, FAreaLight AreaLight, FShadowTerms Shadow, out float OutShadowMask)
+{
+    FDirectLighting Lighting;
+    Lighting.Diffuse = 0;
+    Lighting.Specular = 0;
+    Lighting.Transmission = 0;
+
+    // Decode NPR parameters (lower 4 bits of each channel)
+    float shadowThreshold   = DecodeNPR(GBuffer.Metallic);
+#if LIGHT_SOURCE_SHAPE == 0
+    float shadowBrightness  = DecodeNPR(GBuffer.Specular);
+#endif
+    float shadowSoftness    = DecodeNPR(GBuffer.Roughness);
+
+    //=========================================================================
+    // Diffuse: Toon Shadow Bands
+    //=========================================================================
+
+    // Surface Shadow
+    // threshold < 0.5 : CSM is disabled (only show complete shadow)
+    // threshold >= 0.5 : CSM is enabled (show partial shadow)
+    float surfaceShadow = 1.0;
+    BRANCH
+    if (shadowThreshold > 0.0)
+    {
+        float csmSmooth = min(smoothstep(0.1, 0.5, NoL),  Shadow.SurfaceShadow);
+        float csmSharp =  min(step(0.1, NoL), step(NoL, Shadow.SurfaceShadow));
+        surfaceShadow = lerp(csmSharp, csmSmooth, shadowSoftness);
+    }
+
+    // Final shadow mask
+    // Directional light: lambert shadow + surface shadow with brightness remapping
+    // Point/Spot/Rect: only surface shadow
+#if LIGHT_SOURCE_SHAPE == 0
+    float HNoL = dot(N, L) * 0.5 + 0.5;
+    float lambertShadow = smoothstep(shadowThreshold, shadowThreshold + max(0.00001, shadowSoftness * 0.5), HNoL);
+    float shadowMask = lerp(shadowBrightness, 1.0, min(lambertShadow, surfaceShadow));
+#else
+    float shadowMask = surfaceShadow;
+#endif
+    
+    // Output shadow mask for MRT (Max blend: any light illuminating removes tint)
+    OutShadowMask = shadowMask;
+
+    float3 litColor = GBuffer.DiffuseColor * AreaLight.FalloffColor;
+
+    // Match the engine's local-light distance falloff.  Toon banding replaces
+    // the engine's Lambert NoL term, but it must not discard capsule/point
+    // inverse-square falloff supplied by the integration context.
+    Lighting.Diffuse = litColor * (Falloff * shadowMask);
+
+    //=========================================================================
+    // Specular: Engine's GGX (identical to DefaultLitBxDF, non-anisotropic path)
+    // Only computed when not fully in shadow
+    // NPR accumulator omits Shadow.SurfaceShadow multiply.
+    //=========================================================================
+#if LIGHT_SOURCE_SHAPE == 0
+    BRANCH
+    if (shadowMask > shadowBrightness)
+#else
+    BRANCH
+    if (shadowMask > 0)
+#endif
+    {
+        BxDFContext Context;
+        Init(Context, N, V, L);
+        SphereMaxNoH(Context, AreaLight.SphereSinAlpha, true);
+        Context.NoV = saturate(abs(Context.NoV) + 1e-5);
+
+        if (IsRectLight(AreaLight))
+        {
+            Lighting.Specular = RectGGXApproxLTC(GBuffer.Roughness, GBuffer.SpecularColor, N, V, AreaLight.Rect, AreaLight.Texture);
+        }
+        else
+        {
+            Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * SpecularGGX(GBuffer.Roughness, GBuffer.SpecularColor, Context, NoL, AreaLight);
+        }
+
+        //FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
+        //Lighting.Diffuse *= ComputeEnergyPreservation(EnergyTerms);
+        //Lighting.Specular *= ComputeEnergyConservation(EnergyTerms);
+
+        // Apply shadow to specular (NPR accumulator omits Shadow.SurfaceShadow multiply)
+        Lighting.Specular *= shadowMask;
+    }
+
+    return Lighting;
+}
+
+//=============================================================================
+// NPR IntegrateBxDF for Capsule Lights
+// Mirrors engine's IntegrateBxDF(GBuffer, N, V, Capsule, Shadow, bInverseSquared)
+// from CapsuleLightIntegrate.ush
+//=============================================================================
+
+FDirectLighting NPRIntegrateBxDF(FGBufferData GBuffer, half3 N, half3 V, FCapsuleLight Capsule, FShadowTerms Shadow, bool bInverseSquared, out float OutShadowMask)
+{
+    GBuffer.Roughness = max(GBuffer.Roughness, View.MinRoughness);
+    FAreaLightIntegrateContext Context = CreateCapsuleIntegrateContext(GBuffer.Roughness, N, V, Capsule, bInverseSquared);
+    return NPRLitBxDF(GBuffer, N, V, Context.L, Context.Falloff, Context.NoL, Context.AreaLight, Shadow, OutShadowMask);
+}
+
+//=============================================================================
+// NPR IntegrateBxDF for Rect Lights
+// Mirrors engine's IntegrateBxDF(GBuffer, N, V, Rect, Shadow, SourceTexture)
+// from RectLightIntegrate.ush
+//=============================================================================
+
+FDirectLighting NPRIntegrateBxDF(FGBufferData GBuffer, half3 N, half3 V, FRect Rect, FShadowTerms Shadow, FRectTexture SourceTexture, out float OutShadowMask)
+{
+    // Compute distance to light plane and cull if not larger than threshold
+    // to avoid numerical issue in (nearly) coplanar configuration
+    const float Distance = dot(Rect.Axis[2], Rect.Origin);
+
+    // No-visible rect light due to barn door occlusion
+    FDirectLighting Out = (FDirectLighting)0;
+    OutShadowMask = 0.0;  // Default to shadow (Max blend: rect light won't contribute if not visible)
+    BRANCH if (IsRectVisible(Rect) && Distance > 0.001f)
+    {
+        FAreaLightIntegrateContext Context = CreateRectIntegrateContext(GBuffer.Roughness, N, V, Rect, SourceTexture);
+        GBuffer.Roughness = max(GBuffer.Roughness, 0.02);
+        Out = NPRLitBxDF(GBuffer, N, V, Context.L, Context.Falloff, Context.NoL, Context.AreaLight, Shadow, OutShadowMask);
+    }
+    return Out;
+}

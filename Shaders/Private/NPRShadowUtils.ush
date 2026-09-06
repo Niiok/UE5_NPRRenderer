@@ -1,0 +1,220 @@
+// NPR Shadow Utilities
+// Contains: Shadow parameter declarations, Point/Spot shadow, CSM shadow calculations
+// These replace the engine's shadow projection pass with inline shadow computation.
+//
+// Parameters are conditionally declared based on NPR_SHADOW_TYPE permutation:
+//   NPR_SHADOW_TYPE == 0: No shadow — all shadow params stripped by compiler
+//   NPR_SHADOW_TYPE == 1: Point cubemap — only cubemap params active
+//   NPR_SHADOW_TYPE == 2: 2D ManualPCF — only CSM/Spot params active
+// This ensures Point and CSM params never coexist in the GPU cbuffer.
+
+#pragma once
+
+#include "/Engine/Private/ShadowProjectionCommon.ush"
+#include "/Engine/Private/ShadowFilteringCommon.ush"
+
+#if NPR_SHADOW_TYPE > 0
+//=============================================================================
+// Common Shadow Post-Processing (shared by Point and 2D shadow types)
+// Same as engine's ShadowProjectionPixelShader.usf
+//=============================================================================
+
+float ShadowSharpen;
+float ShadowFadeFraction;
+
+float ApplyShadowPostProcessing(float Shadow)
+{
+    // Step 1: ShadowSharpen
+    Shadow = saturate((Shadow - 0.5) * ShadowSharpen + 0.5);
+    // Step 2: ApplyPCFOverBlurCorrection = Square()
+    Shadow = Shadow * Shadow;
+    // Step 3: ShadowFadeFraction blend
+    Shadow = lerp(1.0f, Shadow, ShadowFadeFraction);
+    return Shadow;
+}
+#endif // NPR_SHADOW_TYPE > 0
+
+#if NPR_SHADOW_TYPE == 1
+//=============================================================================
+// Point Light Cubemap Shadow Parameters & Calculation
+// Replicates engine's MainOnePassPointLightPS (ShadowProjectionPixelShader.usf:422-509)
+// Active ONLY for this permutation — stripped from 2D/None variants
+//=============================================================================
+
+// .x:DepthBias, .y:SlopeDepthBias, .z:MaxSlopeDepthBias (engine ShadowProjectionPixelShader.usf:417)
+float3 PointLightDepthBias;
+
+float ComputePointLightShadow(float3 TranslatedWorldPosition, float3 LightTranslatedWorldPosition, float LightInvRadius, float3 WorldNormal)
+{
+    // Normal receiver bias (engine ShadowProjectionPixelShader.usf:468-486)
+    float3 LightDirection = normalize(LightTranslatedWorldPosition - TranslatedWorldPosition);
+    float NoL = saturate(dot(WorldNormal, LightDirection));
+    float SlopeBias = (1 - NoL) * PointLightDepthBias.y;
+
+    float Shadow = CubemapHardwarePCF(
+        TranslatedWorldPosition,
+        LightTranslatedWorldPosition,
+        LightInvRadius,
+        PointLightDepthBias.x,     // DepthBias
+        SlopeBias,                  // NoL-modulated SlopeBias (engine identical)
+        PointLightDepthBias.z);     // MaxSlopeDepthBias
+
+    return ApplyShadowPostProcessing(Shadow);
+}
+#endif // NPR_SHADOW_TYPE == 1
+
+#if NPR_SHADOW_TYPE == 2
+//=============================================================================
+// 2D Shadow (CSM / Spot) Parameters & Calculation
+// Active ONLY for this permutation — stripped from Point/None variants
+// Spot uses NumCSMCascades=1 with a single matrix (CSMScreenToShadowMatrix0)
+//=============================================================================
+
+uint NumCSMCascades;
+float4x4 CSMScreenToShadowMatrix0;
+float4x4 CSMScreenToShadowMatrix1;
+float4x4 CSMScreenToShadowMatrix2;
+float4x4 CSMScreenToShadowMatrix3;
+
+float4x4 GetCSMScreenToShadowMatrix(uint CascadeIdx)
+{
+    float4x4 Matrices[4] = { 
+        CSMScreenToShadowMatrix0, 
+        CSMScreenToShadowMatrix1, 
+        CSMScreenToShadowMatrix2, 
+        CSMScreenToShadowMatrix3 
+    };
+    return Matrices[min(CascadeIdx, 3u)];
+}
+
+float4 CSMSoftTransitionScale;
+float4 CSMCascadeEndDepth;
+
+// NPR_USE_RECEIVER_BIAS: NoL-based TransitionScale modulation
+// Engine ignores this (SHADING_PATH_DEFERRED=0 in ShadowProjectionPixelShader.usf)
+// Set to 1 to enable, 0 to match engine behavior (disabled)
+#ifndef NPR_USE_RECEIVER_BIAS
+#define NPR_USE_RECEIVER_BIAS 0
+#endif
+
+#if NPR_USE_RECEIVER_BIAS
+// CSMReceiverBias: Single float — same CVar (r.Shadow.CSMReceiverBias) for all cascades
+float CSMReceiverBias;
+#endif
+
+#if NPR_CSM_BLEND_CASCADES
+// CSMFadeRegionFraction: Single float — fraction of cascade length for fade region
+// Same approach as engine's CascadeTransitionFraction (DirectionalLightComponent.cpp:923)
+float CSMFadeRegionFraction;
+#endif
+
+float GetCSMSoftTransitionScale(uint i) { return CSMSoftTransitionScale[i]; }
+float GetCSMCascadeEndDepth(uint i)     { return CSMCascadeEndDepth[i]; }
+#if NPR_USE_RECEIVER_BIAS
+float GetCSMReceiverBias(uint i)        { return CSMReceiverBias; }  // Same value for all cascades
+#endif
+
+#if NPR_CSM_BLEND_CASCADES
+// Derive FadePlaneOffset and FadeLength from CSMCascadeEndDepth × CSMFadeRegionFraction
+// Same calculation as engine: FadeLength = CascadeLength × Fraction
+float2 GetCSMFadePlaneParams(uint CascadeIndex)
+{
+    float CascadeEnd = GetCSMCascadeEndDepth(CascadeIndex);
+    float CascadeStart = (CascadeIndex == 0) ? 0.0 : GetCSMCascadeEndDepth(CascadeIndex - 1);
+    float CascadeLength = CascadeEnd - CascadeStart;
+    
+    float FadeLength = CascadeLength * CSMFadeRegionFraction;
+    float FadePlaneOffset = CascadeEnd - FadeLength;
+    
+    return float2(FadePlaneOffset, FadeLength);
+}
+#endif
+
+float SampleCascadeShadow(uint CascadeIdx, float4 ScreenPosition, float NoL)
+{
+    float4x4 CascadeMatrix = GetCSMScreenToShadowMatrix(CascadeIdx);
+    float CascadeTransitionScale = GetCSMSoftTransitionScale(CascadeIdx);
+
+    float4 ShadowPos = mul(ScreenPosition, CascadeMatrix);
+    float ShadowZ = 1 - ShadowPos.z;
+    ShadowPos.xyz /= ShadowPos.w;
+    float PixelDepth = min(ShadowZ, 0.99999f);
+
+    FPCFSamplerSettings Settings;
+    Settings.ShadowDepthTexture = ShadowDepthTexture;
+    Settings.ShadowDepthTextureSampler = ShadowDepthTextureSampler;
+    Settings.ShadowBufferSize = ShadowBufferSize;
+
+#if NPR_USE_RECEIVER_BIAS
+    // NoL-modulated TransitionScale (engine code exists but is disabled)
+    float CascadeReceiverBias = GetCSMReceiverBias(CascadeIdx);
+    Settings.TransitionScale = CascadeTransitionScale * lerp(CascadeReceiverBias, 1.0f, NoL);
+#else
+    // Engine behavior: SHADING_PATH_DEFERRED=0 → ReceiverBias ignored
+    Settings.TransitionScale = CascadeTransitionScale;
+#endif
+    Settings.SceneDepth = PixelDepth;
+    Settings.bSubsurface = false;
+    Settings.bTreatMaxDepthUnshadowed = false;
+    Settings.DensityMulConstant = 0;
+    Settings.ProjectionDepthBiasParameters = 0;
+
+    return ManualPCF(ShadowPos.xy, Settings);
+}
+
+float ComputeDirectionalLightShadow(float4 ScreenPosition, float SceneDepth, float NoL)
+{
+    BRANCH if (NumCSMCascades == 0)
+    {
+        return 1.0f;
+    }
+
+    // Select cascade based on view-space depth
+    uint CascadeIndex = NumCSMCascades - 1;
+    UNROLL
+    for (uint i = 0; i < 4; i++)
+    {
+        if (i < NumCSMCascades && SceneDepth < GetCSMCascadeEndDepth(i))
+        {
+            CascadeIndex = i;
+            break;
+        }
+    }
+
+    // Past the last cascade's far split there is no shadow data — leave unshadowed (engine emits 1.0
+    // beyond the CSM range; sampling the last cascade with out-of-range UVs would smear a shadow band).
+    if (SceneDepth >= GetCSMCascadeEndDepth(NumCSMCascades - 1))
+    {
+        return 1.0f;
+    }
+
+    // Sample and post-process current cascade (engine processes each cascade BEFORE blending)
+    float DynamicShadowFactor = SampleCascadeShadow(CascadeIndex, ScreenPosition, NoL);
+    DynamicShadowFactor = ApplyShadowPostProcessing(DynamicShadowFactor);
+
+#if NPR_CSM_BLEND_CASCADES
+    // Cascade blending in fade region
+    // Engine renders far→near and blends PROCESSED values via hardware alpha blend
+    float2 FadeParams = GetCSMFadePlaneParams(CascadeIndex);
+    float FadePlaneOffset = FadeParams.x;
+    float FadeLength = FadeParams.y;
+
+    BRANCH if (FadeLength > 0 && CascadeIndex + 1 < NumCSMCascades)
+    {
+        float BlendFactor = saturate((SceneDepth - FadePlaneOffset) / FadeLength);
+
+        if (BlendFactor > 0)
+        {
+            // Sample and post-process next cascade BEFORE blending (same as engine)
+            float NextCascadeShadow = SampleCascadeShadow(CascadeIndex + 1, ScreenPosition, NoL);
+            NextCascadeShadow = ApplyShadowPostProcessing(NextCascadeShadow);
+
+            // Blend already-processed values (matches engine hardware alpha blend)
+            DynamicShadowFactor = lerp(DynamicShadowFactor, NextCascadeShadow, BlendFactor);
+        }
+    }
+#endif
+
+    return DynamicShadowFactor;
+}
+#endif // NPR_SHADOW_TYPE == 2

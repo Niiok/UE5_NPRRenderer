@@ -1,0 +1,40 @@
+// NPR Shadow Pixel Shader
+// Applies NPR shadow color from GBuffer.CustomData.rgb based on accumulated ShadowMask.
+// Engine's SkyLight pass handles actual sky lighting - this pass only adds shadow color.
+//
+// Flow:
+// 1. NPR Light passes accumulate ShadowMask (Max blend: brightest wins)
+// 2. This pass applies: ShadowColor * (1 - ShadowMask)
+// 3. CustomData.rgb is then cleared so engine's SkyLight doesn't see it
+// 4. Engine's ReflectionEnvironmentSkyLighting runs normally
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+
+Texture2D ShadowMaskTexture;
+SamplerState ShadowMaskSampler;
+
+void MainPS(
+	float2 ScreenUV : TEXCOORD0,
+	float3 ScreenVector : TEXCOORD1,
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	OutColor = 0;
+
+	// Point-load (not bilinear): these are data textures — bilinear filtering would bleed the shadow
+	// mask / shadow color across material & depth silhouettes.
+	const int3 PixelCoord = int3(SvPosition.xy, 0);
+
+	// Shadow mask (0 = fully in shadow, 1 = fully lit)
+	float ShadowMask = ShadowMaskTexture.Load(PixelCoord).r;
+
+	// Early out if fully lit (saves the GBufferD load)
+	BRANCH
+	if (ShadowMask < 1.0)
+	{
+		// GBufferD.rgb = NPR shadow color
+		float3 ShadowColor = SceneTexturesStruct.GBufferDTexture.Load(PixelCoord).rgb;
+		OutColor.rgb = ShadowColor * (1.0 - ShadowMask);
+	}
+}

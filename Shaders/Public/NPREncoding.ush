@@ -1,0 +1,36 @@
+// NPR 4+4 Bit Encoding: [PBR 4bit | NPR 4bit] = 8bit per channel
+
+#ifndef NPR_ENCODING_USH
+#define NPR_ENCODING_USH
+
+#include "/Engine/Private/PackUnpack.ush"
+
+#define NPR_PARAM_BITS      4u
+#define NPR_PARAM_MAX       ((1u << NPR_PARAM_BITS) - 1u)    // 15
+#define NPR_PARAM_MASK      NPR_PARAM_MAX                    // 0xF
+
+// Encode: float 0~1 → 4bit quantization → combine → float 0~1
+float EncodeNPR(float PBR, float NPR)
+{
+    uint PBRLevel = (uint)round(saturate(PBR) * (float)NPR_PARAM_MAX);
+    uint NPRLevel = (uint)round(saturate(NPR) * (float)NPR_PARAM_MAX);
+    return UnpackR8((PBRLevel << NPR_PARAM_BITS) | NPRLevel);
+}
+
+float3 EncodeNPR_MSR(float M, float S, float R, float NPR_M, float NPR_S, float NPR_R)
+{
+    return float3(
+        EncodeNPR(M, NPR_M),
+        EncodeNPR(S, NPR_S),
+        EncodeNPR(R, NPR_R)
+    );
+}
+
+// Decode: extract lower 4 bits (PBR uses GBuffer value directly)
+float DecodeNPR(float GBufferValue)
+{
+    uint Encoded = (uint)round(GBufferValue * (float)0xFF);
+    return (float)(Encoded & NPR_PARAM_MASK) / (float)NPR_PARAM_MAX;
+}
+
+#endif // NPR_ENCODING_USH
