@@ -99,7 +99,7 @@ FDirectLighting NPRLitBxDF(FGBufferData GBuffer, half3 N, half3 V, half3 L, floa
         }
         else
         {
-            Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * SpecularGGX(GBuffer.Roughness, GBuffer.SpecularColor, Context, NoL, AreaLight);
+            Lighting.Specular = AreaLight.FalloffColor * (Falloff * NoL) * SpecularGGX(GBuffer.Roughness, GBuffer.SpecularColor, Context, AreaLight);
         }
 
         //FBxDFEnergyTerms EnergyTerms = ComputeGGXSpecEnergyTerms(GBuffer.Roughness, Context.NoV, GBuffer.SpecularColor);
@@ -122,8 +122,8 @@ FDirectLighting NPRLitBxDF(FGBufferData GBuffer, half3 N, half3 V, half3 L, floa
 FDirectLighting NPRIntegrateBxDF(FGBufferData GBuffer, half3 N, half3 V, FCapsuleLight Capsule, FShadowTerms Shadow, bool bInverseSquared, out float OutShadowMask)
 {
     GBuffer.Roughness = max(GBuffer.Roughness, View.MinRoughness);
-    FAreaLightIntegrateContext Context = CreateCapsuleIntegrateContext(GBuffer.Roughness, N, V, Capsule, bInverseSquared);
-    return NPRLitBxDF(GBuffer, N, V, Context.L, Context.Falloff, Context.NoL, Context.AreaLight, Shadow, OutShadowMask);
+    FAreaLight AreaLight = CreateAreaLight(GBuffer.Roughness, N, V, Capsule, bInverseSquared);
+    return NPRLitBxDF(GBuffer, N, V, AreaLight.SpecularL, AreaLight.Falloff, AreaLight.NoL, AreaLight, Shadow, OutShadowMask);
 }
 
 //=============================================================================
@@ -143,9 +143,9 @@ FDirectLighting NPRIntegrateBxDF(FGBufferData GBuffer, half3 N, half3 V, FRect R
     OutShadowMask = 0.0;  // Default to shadow (Max blend: rect light won't contribute if not visible)
     BRANCH if (IsRectVisible(Rect) && Distance > 0.001f)
     {
-        FAreaLightIntegrateContext Context = CreateRectIntegrateContext(GBuffer.Roughness, N, V, Rect, SourceTexture);
+        FAreaLight AreaLight = CreateAreaLight(GBuffer.Roughness, N, V, Rect, SourceTexture);
         GBuffer.Roughness = max(GBuffer.Roughness, 0.02);
-        Out = NPRLitBxDF(GBuffer, N, V, Context.L, Context.Falloff, Context.NoL, Context.AreaLight, Shadow, OutShadowMask);
+        Out = NPRLitBxDF(GBuffer, N, V, AreaLight.SpecularL, AreaLight.Falloff, AreaLight.NoL, AreaLight, Shadow, OutShadowMask);
     }
     return Out;
 }

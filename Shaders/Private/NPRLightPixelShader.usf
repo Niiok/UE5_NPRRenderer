@@ -194,7 +194,7 @@ FLightAccumulator NPRAccumulateDynamicLighting(
         FShadowTerms Shadow;
         Shadow.SurfaceShadow = AmbientOcclusion;
         Shadow.TransmissionShadow = 1;
-        Shadow.TransmissionThickness = 1;
+        Shadow.TransmittanceOrOpticalThickness = 1;
         Shadow.HairTransmittance.OpaqueVisibility = 1;
         const float ContactShadowOpacity = GBuffer.CustomData.a;
         GetShadowTerms(GBuffer.Depth, GBuffer.PrecomputedShadowFactors, GBuffer.ShadingModelID, ContactShadowOpacity,

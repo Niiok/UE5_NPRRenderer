@@ -23,7 +23,7 @@
 #include "ReflectionEnvironment.h"  // For SetupSkyIrradianceEnvironmentMapConstantsFromSkyIrradiance + FReflectionUniformParameters
 #include "ReflectionUniformWrapper.h"  // ReflectionStruct binding wrapper
 #include "ReflectionCaptureWrapper.h"  // ReflectionCaptureSM5 binding wrapper
-#include "SceneProxies/SkyLightSceneProxy.h"  // For FSkyLightSceneProxy
+#include "SceneProxies/SkyLightSceneProxy.h"  // For FSkyLightSceneProxy (GetEffectiveLightColor)
 #include "Components/SkyLightComponent.h"  // For USkyLightComponent (GetLightColor/Intensity)
 
 // Declared before render-time validation paths that look up this collector.
@@ -253,7 +253,7 @@ void RenderNPRLight(
 		if (SceneRendererInterface)
 		{
 			FSceneRenderer* SceneRenderer = static_cast<FSceneRenderer*>(SceneRendererInterface);
-			if (LightSceneInfo->Id < SceneRenderer->VisibleLightInfos.Num())
+			if (LightSceneInfo->Id.GetIndex() < SceneRenderer->VisibleLightInfos.Num())
 			{
 				const FVisibleLightInfo& VisibleLightInfo = SceneRenderer->VisibleLightInfos[LightSceneInfo->Id];
 				

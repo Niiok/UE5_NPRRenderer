@@ -361,7 +361,7 @@ bool NPRLightRenderingUtils::ShouldRenderLight(const FLightSceneInfo* LightScene
 	bool bLocalVisible = LightSceneInfo->bVisible;
 	
 	// Check visibility based on Id bounds
-	if (LightSceneInfo->Id < View.VisibleLightInfos.Num())
+	if (LightSceneInfo->Id.GetIndex() < View.VisibleLightInfos.Num())
 	{
 		bLocalVisible = bLocalVisible && (bOffscreen 
 			? View.VisibleLightInfos[LightSceneInfo->Id].bInDrawRange 
