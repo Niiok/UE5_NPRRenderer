@@ -65,15 +65,20 @@ void FNPRRendererModule::ShutdownModule()
 // NPR console-variable overrides, applied/stripped together by ApplyNPRConsoleVariables().
 //   r.shadow.ShadowMapsRenderEarly : NPR shadow pass needs shadow maps available early
 //   r.Shadow.Virtual.Enable        : VSM unsupported by the NPR shadow path
+//   r.Visibility.LocalLightPrimitiveInteraction : default 2 skips local light-primitive interactions when
+//                                    MegaLights is enabled for the project, leaving point/spot shadow maps
+//                                    without casters. NPR disables MegaLights, so force them on.
 static const TCHAR* const GNPRConsoleVarNames[] =
 {
 	TEXT("r.shadow.ShadowMapsRenderEarly"),
 	TEXT("r.Shadow.Virtual.Enable"),
+	TEXT("r.Visibility.LocalLightPrimitiveInteraction"),
 };
 static const TCHAR* const GNPRConsoleVarValues[] =
 {
 	TEXT("1"),
 	TEXT("0"),
+	TEXT("1"),
 };
 static_assert(UE_ARRAY_COUNT(GNPRConsoleVarNames) == UE_ARRAY_COUNT(GNPRConsoleVarValues), "NPR cvar name/value count mismatch");
 

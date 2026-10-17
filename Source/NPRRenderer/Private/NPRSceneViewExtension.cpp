@@ -19,6 +19,9 @@ void FNPRSceneViewExtension::SetupNPRShowFlags(FEngineShowFlags& ShowFlags)
 	// Only disable the engine features NPR replaces; features the passes depend on (Lighting,
 	// ReflectionEnvironment, GlobalIllumination) are left as-is and read back by the passes.
 	ShowFlags.SetDeferredLighting(false);      // engine direct lighting replaced by NPR light passes
+	// MegaLights (r.MegaLights.EnableForProject) takes over local lights: their OcclusionType becomes MegaLights,
+	// so the engine allocates no shadow maps for point/spot/rect lights and the NPR passes find no shadow.
+	ShowFlags.SetMegaLights(false);
 	ShowFlags.SetSubsurfaceScattering(false);  // CustomData.rgb repurposed as NPR shadow color
 	// IndirectLightingCache stays ON: the base pass writes GBuffer.IndirectIrradiance from it, which the
 	// NPR reflection pass feeds to the compositor to brighten capture reflections on metal (no sky needed).
